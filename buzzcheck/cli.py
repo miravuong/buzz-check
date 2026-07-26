@@ -1,17 +1,31 @@
 from __future__ import annotations
 
 import argparse
+import http.server
 import json
 import os
 import re
+import secrets
 import sys
-from dataclasses import asdict, dataclass, field
+import urllib.parse
+import webbrowser
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Optional
 
 from dotenv import load_dotenv
 
-from buzzcheck.config import ConfigMissing, Store, config_exists, load_store
+from buzzcheck.config import (
+    CONFIG_PATH,
+    TOKEN_PATH,
+    ConfigMissing,
+    Store,
+    config_exists,
+    load_refresh_token,
+    load_store,
+    save_refresh_token,
+    save_store,
+)
 from buzzcheck.kroger import ClientCreds, KrogerAuthError, KrogerClient, KrogerError
 
 
@@ -353,39 +367,34 @@ def build_stores_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[list[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    if argv and argv[0] in SUBCOMMANDS:
-        cmd = argv[0]
-        rest = argv[1:]
-        try:
+    try:
+        if argv and argv[0] in SUBCOMMANDS:
+            cmd = argv[0]
+            rest = argv[1:]
             if cmd == "stores":
                 return run_stores(rest)
             if cmd == "setup":
-                return _not_implemented("setup", "run `buzzcheck stores --zip <zip>` and hand-write ~/.buzzcheck/config.json")
+                return run_setup(rest)
             if cmd == "auth":
-                return _not_implemented("auth")
+                return run_auth(rest)
             if cmd == "selftest":
-                return _not_implemented("selftest")
-        except UsageError as e:
-            print(f"buzzcheck: {e}", file=sys.stderr)
-            return EXIT_ERROR
-        except KrogerAuthError as e:
-            print(f"buzzcheck: auth error: {e}", file=sys.stderr)
-            return EXIT_ERROR
-        except KrogerError as e:
-            print(f"buzzcheck: API error: {e}", file=sys.stderr)
-            return EXIT_ERROR
-        except ConfigMissing as e:
-            print(f"buzzcheck: {e}", file=sys.stderr)
-            return EXIT_ERROR
-    return run_check(argv)
-
-
-def _not_implemented(cmd: str, hint: str = "") -> int:
-    msg = f"buzzcheck {cmd}: not implemented in phase 1."
-    if hint:
-        msg += f" For now: {hint}"
-    print(msg, file=sys.stderr)
-    return EXIT_ERROR
+                return run_selftest(rest)
+        return run_check(argv)
+    except UsageError as e:
+        print(f"buzzcheck: {e}", file=sys.stderr)
+        return EXIT_ERROR
+    except KrogerAuthError as e:
+        print(f"buzzcheck: auth error: {e}", file=sys.stderr)
+        return EXIT_ERROR
+    except KrogerError as e:
+        print(f"buzzcheck: API error: {e}", file=sys.stderr)
+        return EXIT_ERROR
+    except ConfigMissing as e:
+        print(f"buzzcheck: {e}", file=sys.stderr)
+        return EXIT_ERROR
+    except KeyboardInterrupt:
+        print("\nbuzzcheck: interrupted.", file=sys.stderr)
+        return EXIT_ERROR
 
 
 # ---------- creds loading ----------
@@ -440,8 +449,7 @@ def run_stores(argv: list[str]) -> int:
         dist = f"{row['distance']:.1f} mi" if row["distance"] is not None else ""
         print(f"  {i:>2}  {row['chain']:<18} {row['name']:<28} {addr}  {dist}".rstrip())
     print()
-    print("To pin one, note its ID and (for phase 1) hand-write it into ~/.buzzcheck/config.json:")
-    print('  { "default_store": "primary", "stores": { "primary": { "location_id": "<ID>", "chain": "...", "name": "...", "address": "..." } } }')
+    print(f"To pin one: `buzzcheck setup --zip {args.zip_code} --pick <N>`  (or `buzzcheck setup --location-id <ID>`).")
     return EXIT_ON_SALE
 
 
@@ -466,74 +474,457 @@ def _store_row(s: dict) -> dict:
 def run_check(argv: list[str]) -> int:
     parser = build_main_parser()
     args = parser.parse_args(argv)
-
     try:
-        line_filter = parse_line_arg(args.line)
-    except UsageError as e:
-        print(f"buzzcheck: {e}", file=sys.stderr)
-        return EXIT_ERROR
+        return _run_check_inner(args)
+    except (UsageError, ConfigMissing, KrogerAuthError, KrogerError) as e:
+        if args.json_out:
+            sys.stdout.write(json.dumps({"error": str(e)}) + "\n")
+        raise
 
-    if args.add:
-        # --add is phase 2. Reject up front rather than fetching and then failing.
-        print("buzzcheck: --add is not implemented in phase 1.", file=sys.stderr)
-        return EXIT_ERROR
-    if args.upc:
-        print("buzzcheck: --upc is not implemented in phase 1 (used only with --add).", file=sys.stderr)
-        return EXIT_ERROR
-    if args.qty != 1:
-        print("buzzcheck: --qty is not meaningful without --add (phase 2).", file=sys.stderr)
-        return EXIT_ERROR
 
-    try:
-        creds = load_creds()
-    except UsageError as e:
-        _emit_error(str(e), json_out=args.json_out)
-        return EXIT_ERROR
+def _run_check_inner(args: argparse.Namespace) -> int:
+    line_filter = parse_line_arg(args.line)
+
+    if args.upc and not args.add:
+        raise UsageError("--upc is only meaningful with --add.")
+    if args.qty != 1 and not args.add:
+        raise UsageError("--qty is only meaningful with --add.")
+    if args.qty < 1:
+        raise UsageError("--qty must be a positive integer.")
+    if args.yes and not args.add:
+        raise UsageError("--yes is only meaningful with --add.")
+
+    creds = load_creds()
 
     if not config_exists():
-        _emit_error(
-            "no store pinned. Run `buzzcheck stores --zip <zip>` to find your store, "
-            "then hand-write ~/.buzzcheck/config.json (see README/PRD). "
-            "In phase 2, `buzzcheck setup` will do this for you.",
-            json_out=args.json_out,
+        raise ConfigMissing(
+            "no store pinned. Run `buzzcheck setup` (or `buzzcheck stores --zip <zip>` "
+            "to browse first)."
         )
-        return EXIT_ERROR
+
+    store = load_store(args.store)
+
+    with KrogerClient(creds) as client:
+        variants = fetch_all_variants(client, store.location_id)
+
+        filtered = [v for v in variants if v.line == line_filter] if line_filter else list(variants)
+
+        if args.json_out:
+            sys.stdout.write(render_json(variants, filtered, line_filter, store))
+        else:
+            sys.stdout.write(render_human(variants, filtered, line_filter, store, args.show_all))
+
+        if not filtered:
+            return EXIT_NO_MATCHES
+
+        on_sale = [v for v in filtered if v.on_sale]
+
+        if args.add:
+            if not on_sale:
+                return EXIT_NOT_ON_SALE
+            return _add_flow(client, creds, store, on_sale, args)
+
+        if on_sale:
+            return EXIT_ON_SALE
+        return EXIT_NOT_ON_SALE
+
+
+# ---------- add-to-cart flow ----------
+
+
+KROGER_BANNERS = [
+    "Ralphs", "Fred Meyer", "King Soopers", "Smith's", "Fry's",
+    "QFC", "Dillons", "Harris Teeter", "Food4Less",
+]
+
+
+def _add_flow(client: KrogerClient, creds: ClientCreds, store: Store,
+              on_sale: list[Variant], args: argparse.Namespace) -> int:
+    if args.upc:
+        matches = [v for v in on_sale if v.upc == args.upc]
+        if not matches:
+            raise UsageError(
+                f"--upc {args.upc} is not among the on-sale variants at {store.name or store.location_id}."
+            )
+        chosen = matches[0]
+    elif len(on_sale) == 1:
+        chosen = on_sale[0]
+        if not args.yes:
+            if not _confirm(f"Add {args.qty}x '{chosen.description}' ({chosen.size}) to cart?"):
+                print("buzzcheck: cancelled.", file=sys.stderr)
+                return EXIT_ON_SALE
+    else:
+        if args.yes:
+            raise UsageError(
+                f"{len(on_sale)} variants on sale; --yes only works with exactly one. "
+                "Pass --upc <upc> to pick."
+            )
+        if args.json_out or not sys.stdin.isatty():
+            raise UsageError(
+                f"{len(on_sale)} variants on sale and no tty for a prompt. "
+                "Pass --upc <upc> or --yes (if only one)."
+            )
+        chosen = _pick_variant(on_sale)
+        if chosen is None:
+            print("buzzcheck: cancelled.", file=sys.stderr)
+            return EXIT_ON_SALE
+
+    user_token = _get_user_access_token(client, creds)
 
     try:
-        store = load_store(args.store)
-    except ConfigMissing as e:
-        _emit_error(str(e), json_out=args.json_out)
-        return EXIT_ERROR
-
-    try:
-        with KrogerClient(creds) as client:
-            variants = fetch_all_variants(client, store.location_id)
-    except KrogerAuthError as e:
-        _emit_error(f"auth error: {e}", json_out=args.json_out)
-        return EXIT_ERROR
+        client.add_to_cart(
+            user_access_token=user_token,
+            upc=chosen.upc,
+            quantity=args.qty,
+            modality=args.modality,
+        )
     except KrogerError as e:
-        _emit_error(f"API error: {e}", json_out=args.json_out)
-        return EXIT_ERROR
+        msg = str(e).lower()
+        if "timeout" in msg or "timed out" in msg or "read" in msg and "error" in msg:
+            print(
+                "buzzcheck: cart add outcome is unknown (timeout / ambiguous failure). "
+                "Check your Kroger cart before retrying — the item may already be in it.",
+                file=sys.stderr,
+            )
+            return EXIT_ERROR
+        raise
 
-    if line_filter:
-        filtered = [v for v in variants if v.line == line_filter]
-    else:
-        filtered = list(variants)
+    print(f"Added {args.qty}x '{chosen.description}' to cart ({args.modality}).", file=sys.stderr)
+    return EXIT_ON_SALE
 
-    if args.json_out:
-        sys.stdout.write(render_json(variants, filtered, line_filter, store))
-    else:
-        sys.stdout.write(render_human(variants, filtered, line_filter, store, args.show_all))
 
-    if not filtered:
-        return EXIT_NO_MATCHES
-    if any(v.on_sale for v in filtered):
+def _confirm(prompt: str) -> bool:
+    if not sys.stdin.isatty():
+        return False  # never spend money on Enter-through-a-pipe
+    try:
+        answer = input(f"{prompt} [y/N] ").strip().lower()
+    except EOFError:
+        return False
+    return answer in ("y", "yes")
+
+
+def _pick_variant(variants: list[Variant]) -> Optional[Variant]:
+    print("On sale:", file=sys.stderr)
+    for i, v in enumerate(variants, start=1):
+        print(f"  {i}. {v.description} ({v.size})  ${v.promo:.2f} (was ${v.regular:.2f})", file=sys.stderr)
+    try:
+        raw = input(f"Select [1-{len(variants)}, q to cancel]: ").strip().lower()
+    except EOFError:
+        return None
+    if raw in ("q", ""):
+        return None
+    try:
+        idx = int(raw)
+    except ValueError:
+        return None
+    if 1 <= idx <= len(variants):
+        return variants[idx - 1]
+    return None
+
+
+# ---------- user OAuth (cart write) ----------
+
+
+def _get_user_access_token(client: KrogerClient, creds: ClientCreds) -> str:
+    refresh = load_refresh_token()
+    if not refresh:
+        raise UsageError(
+            "No cart authorization on file. Run `buzzcheck auth` once to grant access."
+        )
+    try:
+        body = client.refresh_user_token(refresh)
+    except KrogerAuthError as e:
+        raise KrogerAuthError(
+            f"Refresh failed ({e}). Run `buzzcheck auth --force` to re-authorize."
+        )
+    new_refresh = body.get("refresh_token")
+    if isinstance(new_refresh, str) and new_refresh and new_refresh != refresh:
+        save_refresh_token(new_refresh)
+    return body["access_token"]
+
+
+class _OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
+    captured: dict = {}
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != "/callback":
+            self.send_response(404)
+            self.end_headers()
+            return
+        qs = urllib.parse.parse_qs(parsed.query)
+        self.captured["code"] = (qs.get("code") or [None])[0]
+        self.captured["state"] = (qs.get("state") or [None])[0]
+        self.captured["error"] = (qs.get("error") or [None])[0]
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        body = (
+            "<html><body style='font-family:sans-serif;padding:2em'>"
+            "<h2>buzzcheck: authorization received.</h2>"
+            "<p>You can close this tab.</p></body></html>"
+        )
+        self.wfile.write(body.encode())
+
+    def log_message(self, *args, **kwargs):  # silence stderr access logs
+        pass
+
+
+def _run_oauth_flow(client: KrogerClient, redirect_uri: str) -> dict:
+    parsed = urllib.parse.urlparse(redirect_uri)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 8000
+    if parsed.path != "/callback":
+        raise UsageError(
+            f"KROGER_REDIRECT_URI must end in /callback (got {redirect_uri})."
+        )
+
+    state = secrets.token_urlsafe(16)
+    _OAuthCallbackHandler.captured = {}
+    auth_url = client.build_authorize_url(redirect_uri=redirect_uri, state=state)
+
+    try:
+        server = http.server.HTTPServer((host, port), _OAuthCallbackHandler)
+    except OSError as e:
+        raise UsageError(
+            f"Cannot bind {host}:{port} for the OAuth callback ({e}). "
+            "Close whatever is using that port, or update KROGER_REDIRECT_URI."
+        )
+
+    print("Opening browser for Kroger authorization...", file=sys.stderr)
+    print(f"If it doesn't open, visit:\n  {auth_url}", file=sys.stderr)
+    try:
+        webbrowser.open(auth_url)
+    except Exception:
+        pass
+
+    try:
+        server.timeout = None
+        while not _OAuthCallbackHandler.captured:
+            server.handle_request()
+    finally:
+        server.server_close()
+
+    captured = _OAuthCallbackHandler.captured
+    if captured.get("error"):
+        raise KrogerAuthError(f"Authorization failed: {captured['error']}")
+    if captured.get("state") != state:
+        raise KrogerAuthError("State mismatch in OAuth callback (possible CSRF).")
+    if not captured.get("code"):
+        raise KrogerAuthError("No authorization code received.")
+
+    return client.exchange_auth_code(code=captured["code"], redirect_uri=redirect_uri)
+
+
+# ---------- auth subcommand ----------
+
+
+def run_auth(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="buzzcheck auth")
+    parser.add_argument("--force", action="store_true", help="Re-run even if a refresh token exists.")
+    args = parser.parse_args(argv)
+
+    creds = load_creds()
+    load_dotenv()
+    redirect_uri = os.environ.get("KROGER_REDIRECT_URI", "http://localhost:8000/callback").strip()
+
+    if load_refresh_token() and not args.force:
+        print(
+            "buzzcheck: cart authorization already exists. Use --force to re-run.",
+            file=sys.stderr,
+        )
         return EXIT_ON_SALE
-    return EXIT_NOT_ON_SALE
+
+    with KrogerClient(creds) as client:
+        body = _run_oauth_flow(client, redirect_uri)
+
+    refresh = body.get("refresh_token")
+    if not isinstance(refresh, str) or not refresh:
+        raise KrogerAuthError("No refresh token in exchange response.")
+    save_refresh_token(refresh)
+    print(f"Cart authorization saved to {TOKEN_PATH}.", file=sys.stderr)
+    return EXIT_ON_SALE
 
 
-def _emit_error(msg: str, *, json_out: bool) -> None:
-    print(f"buzzcheck: {msg}", file=sys.stderr)
-    if json_out:
-        # keep stdout parseable
-        sys.stdout.write(json.dumps({"error": msg}) + "\n")
+# ---------- selftest subcommand ----------
+
+
+def run_selftest(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="buzzcheck selftest",
+        description="Diagnostic: confirm the connection works. Not a search.",
+    )
+    # Explicitly reject positional args so users can't sneak in a term.
+    parser.parse_args(argv)
+
+    creds = load_creds()
+    if not config_exists():
+        raise ConfigMissing(
+            "no store pinned. Run `buzzcheck setup` first."
+        )
+    store = load_store()
+
+    with KrogerClient(creds) as client:
+        # Force a token fetch so we can report auth status separately.
+        client._get_app_token()
+        products = client.search_products(location_id=store.location_id, term="milk", limit=25)
+
+    total = sum(len(p.get("items") or []) or 1 for p in products)
+    priced = 0
+    for p in products:
+        for item in (p.get("items") or [{}]):
+            price = item.get("price") or {}
+            if price.get("regular") or price.get("promo"):
+                priced += 1
+
+    print(f"Store:    {store.name or store.location_id} ({store.location_id})", file=sys.stderr)
+    print("Auth:     ok (client credentials)", file=sys.stderr)
+    print(f'Query:    "milk" returned {total} items, {priced} with prices', file=sys.stderr)
+    print("", file=sys.stderr)
+    if priced > 0:
+        print(
+            "Connection is working. If `buzzcheck` finds nothing, this store "
+            "does not stock BuzzBallz.",
+            file=sys.stderr,
+        )
+        return EXIT_ON_SALE
+    print(
+        "No priced items returned. Something is off — check that the pinned "
+        "location_id is a real store and the app has the Products API enabled.",
+        file=sys.stderr,
+    )
+    return EXIT_ERROR
+
+
+# ---------- setup subcommand ----------
+
+
+def run_setup(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="buzzcheck setup")
+    parser.add_argument("--zip", dest="zip_code", default=None, help="5-digit ZIP (prompted if absent).")
+    parser.add_argument("--radius", type=int, default=10, help="Miles (default 10, max 100).")
+    parser.add_argument("--chain", default=None, help="Filter to a chain, e.g. Ralphs.")
+    parser.add_argument("--pick", type=int, default=None, help="Non-interactive: pick the Nth result.")
+    parser.add_argument("--location-id", dest="location_id", default=None,
+                        help="Skip search; use this ID directly (validated against the API).")
+    parser.add_argument("--force", action="store_true", help="Overwrite existing config.")
+    parser.add_argument("--name", default="primary", help="Config key for the store (default: primary).")
+    args = parser.parse_args(argv)
+
+    if args.radius < 1 or args.radius > 100:
+        raise UsageError(f"--radius must be between 1 and 100 (got {args.radius}).")
+
+    if config_exists() and not args.force:
+        try:
+            current = load_store()
+            print("A store is already pinned:", file=sys.stderr)
+            print(f"  {current.chain} — {current.name}", file=sys.stderr)
+            print(f"  ID:      {current.location_id}", file=sys.stderr)
+            print(f"  Address: {current.address}", file=sys.stderr)
+            print("Re-run with --force to change.", file=sys.stderr)
+            return EXIT_ERROR
+        except ConfigMissing:
+            pass  # malformed config; treat as overwrite
+
+    creds = load_creds()
+
+    with KrogerClient(creds) as client:
+        if args.location_id:
+            store = _setup_by_id(client, args.location_id)
+        else:
+            store = _setup_by_zip(client, args)
+
+    save_store(store, name=args.name, make_default=True)
+    print("", file=sys.stderr)
+    print(f"Pinned: {store.chain} — {store.name}", file=sys.stderr)
+    print(f"  ID:      {store.location_id}", file=sys.stderr)
+    print(f"  Address: {store.address}", file=sys.stderr)
+    print(f"  Config:  {CONFIG_PATH}", file=sys.stderr)
+    return EXIT_ON_SALE
+
+
+def _setup_by_id(client: KrogerClient, location_id: str) -> Store:
+    if not re.fullmatch(r"\d+", location_id):
+        raise UsageError(f"--location-id must be numeric (got '{location_id}').")
+    data = client.get_location(location_id)
+    if not data:
+        raise UsageError(
+            f"Location {location_id} not found. Run `buzzcheck stores --zip <zip>` to browse."
+        )
+    row = _store_row(data)
+    return Store(
+        location_id=row["location_id"] or location_id,
+        chain=row["chain"],
+        name=row["name"],
+        address=row["address"],
+        resolved_at=_now_iso(),
+    )
+
+
+def _setup_by_zip(client: KrogerClient, args: argparse.Namespace) -> Store:
+    zip_code = args.zip_code
+    if not zip_code:
+        if not sys.stdin.isatty():
+            raise UsageError("--zip is required in non-interactive contexts.")
+        try:
+            zip_code = input("ZIP code: ").strip()
+        except EOFError:
+            raise UsageError("no ZIP provided.")
+    if not re.fullmatch(r"\d{5}", zip_code or ""):
+        raise UsageError(f"invalid zip '{zip_code}' (must be 5 digits).")
+
+    radius = args.radius
+    stores = client.find_locations(zip_code=zip_code, radius=radius, chain=args.chain, limit=25)
+    if not stores:
+        radius = min(radius * 2, 100)
+        print(f"buzzcheck: no stores within {args.radius} mi; retrying at {radius} mi...", file=sys.stderr)
+        stores = client.find_locations(zip_code=zip_code, radius=radius, chain=args.chain, limit=25)
+
+    if not stores:
+        raise UsageError(
+            f"No Kroger-family stores within {radius} miles of {zip_code}. "
+            f"Kroger operates as {', '.join(KROGER_BANNERS)}. "
+            "If none of these operate near you, this tool will not work."
+        )
+
+    rows = [_store_row(s) for s in stores]
+
+    if args.pick is not None:
+        if not (1 <= args.pick <= len(rows)):
+            raise UsageError(
+                f"--pick {args.pick} out of range (found {len(rows)} stores)."
+            )
+        chosen = rows[args.pick - 1]
+    else:
+        if not sys.stdin.isatty():
+            raise UsageError(
+                f"{len(rows)} stores found; pass --pick N in non-interactive contexts."
+            )
+        print(f"Kroger-family stores near {zip_code}:", file=sys.stderr)
+        print("", file=sys.stderr)
+        for i, r in enumerate(rows, start=1):
+            dist = f"{r['distance']:.1f} mi" if r["distance"] is not None else ""
+            print(f"  {i:>2}  {r['chain']:<16} {r['name']:<26} {r['address']}  {dist}".rstrip(),
+                  file=sys.stderr)
+        print("", file=sys.stderr)
+        try:
+            raw = input(f"Select a store [1-{len(rows)}, q to cancel]: ").strip().lower()
+        except EOFError:
+            raise UsageError("cancelled.")
+        if raw in ("", "q"):
+            raise UsageError("cancelled.")
+        try:
+            idx = int(raw)
+        except ValueError:
+            raise UsageError(f"invalid selection '{raw}'.")
+        if not (1 <= idx <= len(rows)):
+            raise UsageError(f"selection {idx} out of range.")
+        chosen = rows[idx - 1]
+
+    return Store(
+        location_id=chosen["location_id"],
+        chain=chosen["chain"],
+        name=chosen["name"],
+        address=chosen["address"],
+        resolved_at=_now_iso(),
+    )

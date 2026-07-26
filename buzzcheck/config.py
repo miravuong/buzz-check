@@ -61,6 +61,28 @@ def load_store(name: Optional[str] = None) -> Store:
     )
 
 
+def save_refresh_token(refresh_token: str) -> None:
+    CONFIG_DIR.mkdir(mode=0o700, exist_ok=True)
+    TOKEN_PATH.write_text(json.dumps({"refresh_token": refresh_token}, indent=2))
+    os.chmod(TOKEN_PATH, 0o600)
+
+
+def load_refresh_token() -> Optional[str]:
+    if not TOKEN_PATH.exists():
+        return None
+    try:
+        data = json.loads(TOKEN_PATH.read_text())
+    except json.JSONDecodeError:
+        return None
+    tok = data.get("refresh_token")
+    return tok if isinstance(tok, str) and tok else None
+
+
+def clear_refresh_token() -> None:
+    if TOKEN_PATH.exists():
+        TOKEN_PATH.unlink()
+
+
 def save_store(store: Store, name: str = "primary", *, make_default: bool = True) -> None:
     CONFIG_DIR.mkdir(mode=0o700, exist_ok=True)
     data: dict = {"default_store": name, "stores": {}}

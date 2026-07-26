@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import base64
 import time
+import urllib.parse
 from dataclasses import dataclass
 from typing import Optional
 
 import httpx
 
 BASE_URL = "https://api.kroger.com/v1"
+AUTHORIZE_PATH = "/connect/oauth2/authorize"
+TOKEN_PATH = "/connect/oauth2/token"
+
+CART_SCOPE = "cart.basic:write"
 
 
 class KrogerError(Exception):
@@ -56,7 +61,7 @@ class KrogerClient:
         if self._app_token and time.time() < self._app_token_exp - 30:
             return self._app_token
         resp = self._client.post(
-            "/connect/oauth2/token",
+            TOKEN_PATH,
             headers={
                 "Authorization": self.creds.basic_auth(),
                 "Content-Type": "application/x-www-form-urlencoded",
@@ -137,3 +142,77 @@ class KrogerClient:
             params["filter.brand"] = brand
         data = self._get("/products", params)
         return data.get("data") or []
+
+    # ---- user-authorization (cart write) ----
+
+    def build_authorize_url(self, *, redirect_uri: str, state: str, scope: str = CART_SCOPE) -> str:
+        qs = urllib.parse.urlencode({
+            "response_type": "code",
+            "client_id": self.creds.client_id,
+            "redirect_uri": redirect_uri,
+            "scope": scope,
+            "state": state,
+        })
+        return f"{BASE_URL}{AUTHORIZE_PATH}?{qs}"
+
+    def exchange_auth_code(self, *, code: str, redirect_uri: str) -> dict:
+        resp = self._client.post(
+            TOKEN_PATH,
+            headers={
+                "Authorization": self.creds.basic_auth(),
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+            },
+        )
+        if resp.status_code != 200:
+            raise KrogerAuthError(
+                f"Code exchange failed: HTTP {resp.status_code} {resp.text[:400]}"
+            )
+        body = resp.json()
+        if "access_token" not in body or "refresh_token" not in body:
+            raise KrogerAuthError(f"Code exchange missing tokens: {body}")
+        return body
+
+    def refresh_user_token(self, refresh_token: str) -> dict:
+        resp = self._client.post(
+            TOKEN_PATH,
+            headers={
+                "Authorization": self.creds.basic_auth(),
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+        )
+        if resp.status_code != 200:
+            raise KrogerAuthError(
+                f"Refresh failed: HTTP {resp.status_code} {resp.text[:400]}"
+            )
+        body = resp.json()
+        if "access_token" not in body:
+            raise KrogerAuthError(f"Refresh missing access_token: {body}")
+        return body
+
+    def add_to_cart(self, *, user_access_token: str, upc: str, quantity: int, modality: str) -> None:
+        resp = self._client.put(
+            "/cart/add",
+            headers={
+                "Authorization": f"Bearer {user_access_token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            json={"items": [{"upc": upc, "quantity": quantity, "modality": modality}]},
+        )
+        if resp.status_code == 204:
+            return
+        if resp.status_code == 401:
+            raise KrogerAuthError("Cart add rejected (401). Token may be expired or revoked.")
+        if resp.status_code == 403 and "scope" in resp.text.lower():
+            raise KrogerAuthError(
+                "Cart add rejected (403 missing scope). Re-run `buzzcheck auth --force`."
+            )
+        raise KrogerError(
+            f"Cart add failed: HTTP {resp.status_code} {resp.text[:400]}"
+        )
