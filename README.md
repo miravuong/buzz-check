@@ -54,8 +54,8 @@ Save your Client ID and Client Secret.
 ### 2. Install
 
 ```bash
-git clone https://github.com/YOURNAME/buzzcheck
-cd buzzcheck
+git clone https://github.com/miravuong/buzz-check
+cd buzz-check
 python -m venv .venv && source .venv/bin/activate
 pip install -e .
 ```
