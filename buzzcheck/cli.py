@@ -40,7 +40,6 @@ EXIT_NO_MATCHES = 3
 # ---------- BuzzBallz search config ----------
 
 BUZZBALLZ_TERMS = ["BuzzBallz", "Buzz Ballz"]
-BUZZBALLZ_BRAND = "BuzzBallz"
 BUZZBALLZ_NORM = "buzzballz"
 
 
@@ -186,11 +185,11 @@ def to_variants(product: dict) -> list[Variant]:
 
 def fetch_all_variants(client: KrogerClient, location_id: str) -> list[Variant]:
     """
-    Query multiple term variants + brand filter, merge, dedup by UPC.
-    Filter is post-fetch; LINE never reaches the API.
+    Query multiple term variants, merge, dedup by UPC. Kroger's /products
+    requires filter.term or filter.productId — brand alone is rejected —
+    so we rely on term queries and post-filter with is_buzzballz.
     """
     queries: list[dict] = [{"term": t} for t in BUZZBALLZ_TERMS]
-    queries.append({"brand": BUZZBALLZ_BRAND})
 
     seen_upcs: set[str] = set()
     variants: list[Variant] = []
