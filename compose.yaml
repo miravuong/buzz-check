@@ -1,0 +1,43 @@
+# Local dev harness. Not a production deployment shape — the real target is a
+# Kubernetes CronJob (see CLAUDE.md "Kubernetes conventions").
+#
+# Usage:
+#   docker compose build
+#   docker compose run --rm buzzcheck                    # JSON check, exit-code-remapped
+#   docker compose run --rm buzzcheck chillers           # line filter
+#   docker compose run --rm -p 8000:8000 --entrypoint buzzcheck \
+#       -e BUZZCHECK_BIND_ANY=1 buzzcheck auth           # OAuth browser flow
+#   docker compose run --rm --entrypoint buzzcheck buzzcheck setup
+
+services:
+  buzzcheck:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: buzzcheck:dev
+    # Loads KROGER_CLIENT_ID / KROGER_CLIENT_SECRET / KROGER_REDIRECT_URI at
+    # run time. `.env` is gitignored and .dockerignored so it never enters the
+    # image; compose reads it from the host at container start.
+    env_file:
+      - .env
+    # For `buzzcheck auth` inside the container, the local HTTP callback
+    # server must bind an interface reachable from the host — see the source
+    # change gated on this variable.
+    environment:
+      BUZZCHECK_BIND_ANY: "1"
+    volumes:
+      # Persist ~/.buzzcheck across runs so `setup` / `auth` state survives.
+      - buzzcheck-state:/home/app/.buzzcheck
+    ports:
+      # Only used by `buzzcheck auth`; harmless for other commands.
+      - "8000:8000"
+    # Read-only rootfs is the Kubernetes shape; keep the local run consistent.
+    read_only: true
+    # tmpfs for anything that legitimately needs /tmp (httpx tempfiles, etc.)
+    tmpfs:
+      - /tmp
+    # No restart policy — this is single-shot by design (invariant 1).
+    restart: "no"
+
+volumes:
+  buzzcheck-state:
