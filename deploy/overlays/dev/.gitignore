@@ -1,0 +1,4 @@
+# Never commit real credentials or user state.
+.env.secret
+token.json
+config.json

@@ -1,0 +1,31 @@
+# Secrets — must never enter a build layer.
+.env
+.env.*
+!.env.example
+
+# Local Python state — the image builds its own venv.
+.venv
+venv
+# Docker's .dockerignore uses Go filepath.Match; bare `__pycache__` only
+# matches at the root, so nested caches sneak in without the `**/` prefix.
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.egg-info
+build
+dist
+
+# VCS + editor + OS cruft.
+.git
+.gitignore
+.github
+.vscode
+.idea
+**/.DS_Store
+
+# Local docs and CI that don't belong in the runtime image.
+README.md
+CLAUDE.md
+
+# Anything a user might have dropped locally that would look like state.
+.buzzcheck

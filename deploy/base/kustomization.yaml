@@ -1,0 +1,24 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Overlays override this to scope to `buzzcheck-dev`, `buzzcheck-prod`, etc.
+namespace: buzzcheck
+
+# Applied to all resources but NOT to pod-template selectors. CronJob has
+# no selector, so this is moot today, but using `labels` (kustomize v5)
+# instead of the deprecated `commonLabels` keeps future resources safe.
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/name: buzzcheck
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - pvc.yaml
+  - cronjob.yaml
+
+# Base uses the local dev tag. Real overlays pin to a registry+digest.
+images:
+  - name: buzzcheck
+    newTag: dev

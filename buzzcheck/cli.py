@@ -677,6 +677,12 @@ def _run_oauth_flow(client: KrogerClient, redirect_uri: str) -> dict:
         raise UsageError(
             f"KROGER_REDIRECT_URI must end in /callback (got {redirect_uri})."
         )
+    # Container escape hatch: parsed.hostname is what the *browser* dials
+    # (which must match the Kroger app registration exactly), but the local
+    # listener has to bind on an interface reachable from the host. Setting
+    # BUZZCHECK_BIND_ANY=1 binds 0.0.0.0 without changing the advertised URI.
+    if os.environ.get("BUZZCHECK_BIND_ANY", "").strip() in ("1", "true", "yes"):
+        host = "0.0.0.0"  # noqa: S104 - intentional, gated by env var
 
     state = secrets.token_urlsafe(16)
     _OAuthCallbackHandler.captured = {}

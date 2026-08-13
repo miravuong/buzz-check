@@ -1,0 +1,58 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Scope the whole overlay to its own namespace so multiple environments
+# can coexist in the same cluster without name collisions.
+namespace: buzzcheck-dev
+
+resources:
+  - ../../base
+
+# Every scheduled run at 15-minute intervals is noisy for dev; every 6
+# hours is enough to catch obvious wiring problems while iterating.
+patches:
+  - target:
+      kind: CronJob
+      name: buzzcheck
+    patch: |-
+      - op: replace
+        path: /spec/schedule
+        value: "0 */6 * * *"
+
+# Credential and state provisioning. These generators read from local
+# files that MUST be gitignored (see deploy/overlays/dev/.gitignore).
+#
+# `disableNameSuffixHash: true` keeps the resource names stable so the
+# base's `envFrom: name: buzzcheck-credentials` and volume `name:
+# buzzcheck-config` references resolve without a hashed suffix. Rolling
+# a credential just means re-applying — pods pick up the new value at
+# next scheduled run.
+secretGenerator:
+  - name: buzzcheck-credentials
+    envs:
+      - .env.secret
+    options:
+      disableNameSuffixHash: true
+  # Uncomment once you have run `buzzcheck auth` locally and want to
+  # allow --add via a manually-triggered Job. Scheduled runs never use
+  # this (invariant 3).
+  # - name: buzzcheck-token
+  #   files:
+  #     - token.json
+  #   options:
+  #     disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: buzzcheck-config
+    files:
+      - config.json
+    options:
+      disableNameSuffixHash: true
+
+# In dev, point at the locally-built image. In a real environment the
+# overlay would set newName to a registry path and pin newTag to a
+# digest.
+images:
+  - name: buzzcheck
+    newName: buzzcheck
+    newTag: dev
