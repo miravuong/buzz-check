@@ -1,0 +1,12 @@
+{
+  "default_store": "primary",
+  "stores": {
+    "primary": {
+      "location_id": "70100123",
+      "chain": "Ralphs",
+      "name": "Ralphs Fresh Fare",
+      "address": "5241 Warner Ave, Huntington Beach, CA 92649",
+      "resolved_at": "2026-01-01T00:00:00Z"
+    }
+  }
+}
