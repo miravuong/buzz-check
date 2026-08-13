@@ -6,10 +6,12 @@
 # Local Python state — the image builds its own venv.
 .venv
 venv
-__pycache__
-*.pyc
-*.pyo
-*.egg-info
+# Docker's .dockerignore uses Go filepath.Match; bare `__pycache__` only
+# matches at the root, so nested caches sneak in without the `**/` prefix.
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.egg-info
 build
 dist
 
@@ -19,7 +21,7 @@ dist
 .github
 .vscode
 .idea
-.DS_Store
+**/.DS_Store
 
 # Local docs and CI that don't belong in the runtime image.
 README.md

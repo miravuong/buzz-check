@@ -32,12 +32,17 @@ COPY --from=build /opt/venv /opt/venv
 COPY docker/run.sh /usr/local/bin/buzzcheck-run
 RUN chmod 0755 /usr/local/bin/buzzcheck-run
 
+# Pre-create the state directory and chown it to app BEFORE the VOLUME
+# directive, so Docker inherits app:app when a named volume is first
+# attached. Otherwise the mount point is root-owned and the CLI's writes
+# (config.json, token.json) fail with EACCES.
+RUN install -d -o app -g app -m 0700 /home/app/.buzzcheck
+
 USER app
 WORKDIR /home/app
 
 # ~/.buzzcheck is where config.json and token.json live. Mount a volume here
-# to persist them across runs; the directory itself is created lazily by the
-# CLI on first write (mode 0700).
+# to persist them across runs.
 VOLUME ["/home/app/.buzzcheck"]
 
 # Default: emit JSON, remap exit codes for batch schedulers. Override the
