@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: buzzcheck
+  labels:
+    app.kubernetes.io/name: buzzcheck
+    app.kubernetes.io/component: batch

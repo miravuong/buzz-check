@@ -1,0 +1,175 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: buzzcheck
+  labels:
+    app.kubernetes.io/name: buzzcheck
+    app.kubernetes.io/component: cron
+spec:
+  # Daily at 9am local time. Override in an overlay if you want a
+  # different cadence — this default is a placeholder, not a decision.
+  schedule: "0 9 * * *"
+  # Requires Kubernetes 1.27+. Without this the schedule is interpreted
+  # as UTC, which is a lie any time daylight saving shifts.
+  timeZone: America/Los_Angeles
+  # Invariant 1 (implicit): overlapping runs would burn the per-account
+  # Kroger rate limit and, on any human-triggered --add path, could
+  # duplicate cart items. Also required by the ReadWriteOnce PVC — two
+  # pods cannot mount it simultaneously anyway.
+  concurrencyPolicy: Forbid
+  # A missed schedule (controller down, etc.) is not worth catching up
+  # on — the next natural fire is fine. 300s is enough headroom for a
+  # brief control-plane blip without piling runs.
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Invariant 1: retries can duplicate cart adds. The scheduled path
+      # never touches /cart/add, but the same image is what an operator
+      # would `kubectl create job --from=cronjob/buzzcheck ...` from, so
+      # we keep the retry-off posture on the template itself.
+      backoffLimit: 0
+      # Bound the blast radius of a hung run so it does not hold the PVC
+      # forever and delay the next scheduled fire.
+      activeDeadlineSeconds: 120
+      # Auto-clean completed Jobs after a day. History limits above keep
+      # a handful around for debugging; this stops the collection from
+      # growing without bound.
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: buzzcheck
+            app.kubernetes.io/component: cron
+        spec:
+          # Invariant 1: paired with backoffLimit=0 to guarantee at most
+          # one attempt.
+          restartPolicy: Never
+          serviceAccountName: buzzcheck
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            # fsGroup makes the mounted PVC group-writable by uid 10001
+            # on volume attach — the alternative is running an
+            # init-container as root just to chown, which is worse.
+            fsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          initContainers:
+            # Seeds config.json (which store) and, only if absent,
+            # token.json (rotating refresh token — invariant 8).
+            - name: seed-state
+              image: buzzcheck
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  # config.json is metadata (store location, chain, etc).
+                  # Safe to overwrite on every run so operators can
+                  # re-pin the store by editing the ConfigMap.
+                  if [ -f /seed/config/config.json ]; then
+                    install -m 0600 /seed/config/config.json /state/config.json
+                    echo "seeded config.json"
+                  else
+                    echo "no seed config.json provided; CLI will exit 2 if state is empty"
+                  fi
+                  # token.json holds the OAuth refresh token, which the
+                  # CLI rotates on every use (invariant 8). Seed ONLY if
+                  # the file does not already exist — clobbering a live
+                  # rotated token would break authorization silently.
+                  if [ ! -f /state/token.json ] && [ -f /seed/token/token.json ]; then
+                    install -m 0600 /seed/token/token.json /state/token.json
+                    echo "seeded token.json (was absent)"
+                  elif [ -f /state/token.json ]; then
+                    echo "token.json already present; not overwriting (invariant 8)"
+                  else
+                    echo "no token.json seed and none on disk; --add will not work"
+                  fi
+              securityContext:
+                readOnlyRootFilesystem: true
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: [ALL]
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 16Mi
+                limits:
+                  cpu: 100m
+                  memory: 32Mi
+              volumeMounts:
+                - name: state
+                  mountPath: /state
+                - name: seed-config
+                  mountPath: /seed/config
+                  readOnly: true
+                - name: seed-token
+                  mountPath: /seed/token
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          containers:
+            - name: buzzcheck
+              image: buzzcheck
+              imagePullPolicy: IfNotPresent
+              # Entrypoint is /usr/local/bin/buzzcheck-run from the
+              # image, which runs `buzzcheck --json` and remaps exit
+              # codes (0/1/3 -> 0, 2 -> 2). Args below are appended to
+              # that command line.
+              #
+              # Invariant 3: scheduled runs never pass --add. Do not add
+              # it here, and do not add it in an overlay. Cart mutation
+              # is always a human-triggered Job.
+              args: []
+              env:
+                # Path.home() looks at $HOME. `useradd --create-home` in
+                # the image already sets this via /etc/passwd, but being
+                # explicit prevents a surprise if someone rebuilds
+                # against a distro that behaves differently.
+                - name: HOME
+                  value: /home/app
+              envFrom:
+                # KROGER_CLIENT_ID + KROGER_CLIENT_SECRET. Overlays
+                # provide this via secretGenerator; base does not ship
+                # credential material.
+                - secretRef:
+                    name: buzzcheck-credentials
+              securityContext:
+                readOnlyRootFilesystem: true
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: [ALL]
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 500m
+                  memory: 128Mi
+              volumeMounts:
+                - name: state
+                  mountPath: /home/app/.buzzcheck
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: state
+              persistentVolumeClaim:
+                claimName: buzzcheck-state
+            - name: seed-config
+              configMap:
+                name: buzzcheck-config
+                # optional so a misconfigured overlay produces a clear
+                # CLI-level error ("no store pinned", exit 2) instead of
+                # a cryptic FailedMount event.
+                optional: true
+            - name: seed-token
+              secret:
+                secretName: buzzcheck-token
+                optional: true
+            - name: tmp
+              emptyDir:
+                sizeLimit: 8Mi

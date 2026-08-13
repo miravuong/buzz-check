@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: buzzcheck-state
+  labels:
+    app.kubernetes.io/name: buzzcheck
+    app.kubernetes.io/component: state
+spec:
+  # ReadWriteOnce is deliberate. concurrencyPolicy=Forbid on the CronJob
+  # ensures at most one pod holds this at a time. Do not switch to RWX to
+  # enable concurrency — the bottleneck is Kroger's per-account rate
+  # limit, not the volume.
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # config.json + token.json are a few KB each. 10Mi is comically
+      # generous but avoids surprising provisioners with a very small ask.
+      storage: 10Mi
