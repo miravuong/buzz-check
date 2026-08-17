@@ -219,6 +219,16 @@ The compose service enables `read_only: true` and mounts a `tmpfs` at
 
 ## Kubernetes deployment
 
+The Kubernetes layer runs the CLI on a schedule as a batch job — its
+purpose is to invoke `buzzcheck --json` at a fixed cadence without a
+human present, persist the rotating OAuth refresh token across runs on
+a mounted volume, and source credentials from Secrets rather than image
+layers or environment files. The container image and CLI are unchanged;
+the manifests only supply scheduling, storage, and credential wiring.
+Scheduled runs are notify-only. Cart mutation (`--add`) remains a
+human-initiated action, either through a manually-triggered Job or a
+direct CLI invocation.
+
 Manifests live under `deploy/` and are managed with Kustomize. The base
 targets Kubernetes 1.27 or newer (required for `CronJob.spec.timeZone`).
 
@@ -299,6 +309,29 @@ and volume references resolve without patching.
 The `buzzcheck-token` Secret generator is commented out by default. Enable
 it only when running `--add` via a manually-triggered in-cluster Job is
 desired.
+
+### Phone notifications (ntfy)
+
+The container's entrypoint wrapper (`docker/run.sh`) optionally sends an
+[ntfy.sh](https://ntfy.sh) push notification whenever a run reports
+`on_sale_count > 0`. Set `BUZZCHECK_NTFY_TOPIC` in the credentials
+Secret; the existing `envFrom` wiring picks it up.
+
+| Variable | Purpose |
+|---|---|
+| `BUZZCHECK_NTFY_TOPIC` | ntfy topic name. Acts as a public-URL password — anyone who knows it can push to your phone. Pick something un-guessable (e.g. `openssl rand -hex 8`). Leave unset to disable notifications. |
+| `BUZZCHECK_NTFY_URL` | ntfy server base URL. Defaults to `https://ntfy.sh`. Override only when self-hosting. |
+
+Subscribe your phone by installing the ntfy app
+([iOS](https://apps.apple.com/us/app/ntfy/id1625396347) /
+[Android](https://play.google.com/store/apps/details?id=io.heckel.ntfy))
+and subscribing to the same topic string.
+
+Notification failures never affect the run's exit code. The check
+succeeding is the primary contract; ntfy is a side channel. Notifications
+fire only on `on_sale_count > 0` — no heartbeat, no error-path pings.
+For dead-token / silent-failure alerting, see the planned Prometheus
+Pushgateway integration in `CLAUDE.md`.
 
 ### Validation
 
